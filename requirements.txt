@@ -1,0 +1,3 @@
+fyers-apiv2
+yfinance
+pandas
