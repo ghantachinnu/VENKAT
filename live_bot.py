@@ -1,3 +1,51 @@
+import os
+import time
+from fyers_apiv2 import fyersModel
+import pandas as pd
+import datetime
+
+# --- CONFIGURATION ---
+# We get these keys from Render (Environment Variables)
+client_id = os.environ.get("FYERS_CLIENT_ID")
+access_token = os.environ.get("FYERS_ACCESS_TOKEN")
+
+# --- CONNECT TO FYERS ---
+def connect_to_fyers():
+    try:
+        # Initialize Fyers Model
+        fyers = fyersModel.FyersModel(client_id=client_id, token=access_token, log_path="")
+        
+        # Check profile to confirm connection
+        profile = fyers.get_profile()
+        if profile.get("code") == 200:
+            print(f"SUCCESS: Connected to Fyers as {profile['data']['name']}")
+            return fyers
+        else:
+            print(f"ERROR: Connection Failed. Reason: {profile.get('message')}")
+            return None
+    except Exception as e:
+        print(f"ERROR: Exception during connection: {e}")
+        return None
+
+# --- MAIN LOOP ---
+def run_bot():
+    print("--- BOT STARTED ---")
+    print(f"Time: {datetime.datetime.now()}")
+    
+    # 1. Connect
+    fyers = connect_to_fyers()
+    
+    # 2. Loop Forever
+    if fyers:
+        while True:
+            print(f"Bot is running... {datetime.datetime.now()}")
+            # This is where we will add the trading strategy later!
+            time.sleep(60) # Sleep for 1 minute
+    else:
+        print("Bot failed to connect. Please check your Token in Render.")
+
+if __name__ == "__main__":
+    run_bot()
 # --- This is file 1: `generate_token.py` ---
 # You MUST run this file on your OWN PC every morning.
 # DO NOT UPLOAD THIS TO GITHUB.
