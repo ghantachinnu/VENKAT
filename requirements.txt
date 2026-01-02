@@ -1,3 +1,4 @@
-fyers-api
-yfinance
+fyers-apiv2
 pandas
+numpy
+requests
