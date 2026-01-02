@@ -1,4 +1,4 @@
-fyers-apiv2
+fyers-apiv3
 pandas
 numpy
 requests
