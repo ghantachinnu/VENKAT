@@ -2,4 +2,3 @@ fyers-apiv3
 pandas
 numpy
 requests
-pyotp
