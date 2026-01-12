@@ -13,7 +13,7 @@ access_token = os.environ.get("FYERS_ACCESS_TOKEN", "").strip()
 SYMBOLS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]
 TIMEFRAME = "5"
 INITIAL_CAPITAL = 50000
-LOT_SIZE_NIFTY = 25      # your choice for sim; real 2026 ~65 per NSE update
+LOT_SIZE_NIFTY = 25                 # your simulation choice
 LOT_SIZE_BANKNIFTY = 15
 
 # ── POSITION SIZING ──────────────────────────────────────────────────────────
@@ -44,7 +44,7 @@ def connect_to_fyers():
         print("Connection error:", e)
         return None
 
-# ── STRATEGY CORE ────────────────────────────────────────────────────────────
+# ── STRATEGY ─────────────────────────────────────────────────────────────────
 def check_strategy(fyers, symbol):
     try:
         today = datetime.date.today()
@@ -70,7 +70,7 @@ def check_strategy(fyers, symbol):
         current_price = float(df['close'].iloc[-1])
 
         # Indicators
-        df['ema9']  = df['close'].ewm(span=9,  adjust=False).mean()
+        df['ema9']  = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         trend_up   = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
         trend_down = df['ema9'].iloc[-1] < df['ema21'].iloc[-1]
@@ -81,24 +81,24 @@ def check_strategy(fyers, symbol):
         atr = tr.rolling(14).mean().iloc[-1]
         vol_pct = (atr / current_price) * 100
 
-        mom5  = (current_price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
-        mom10 = (current_price - df['close'].iloc[-10]) / df['close'].iloc[-10] * 100
+        mom5  = (current_price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100 if len(df) >= 5 else 0
+        mom10 = (current_price - df['close'].iloc[-10]) / df['close'].iloc[-10] * 100 if len(df) >= 10 else 0
 
-        # ── OPTION CHAIN (FIXED) ───────────────────────────────────────────────
+        # ── OPTION CHAIN ───────────────────────────────────────────────────────
         chain_payload = {
-            "symbol": symbol.replace("-INDEX", ""),  # "NIFTY50" or "NIFTYBANK"
-            "strikecount": "10",                     # limited strikes = faster & safer
+            "symbol": symbol,                    # ← FIXED: full symbol "NSE:NIFTY50-INDEX"
+            "strikecount": "10",                 # limited range = faster response
             "timestamp": ""
         }
 
         chain_resp = fyers.optionchain(chain_payload)
 
         if chain_resp.get('code') != 200:
-            print(f"Optionchain failed {symbol}: {chain_resp}")
+            print(f"Optionchain failed {symbol}: {chain_resp.get('message', chain_resp)}")
             return
 
         if 'data' not in chain_resp or 'options' not in chain_resp['data']:
-            print(f"Invalid optionchain structure {symbol}: {chain_resp}")
+            print(f"Invalid optionchain response {symbol}: {chain_resp}")
             return
 
         options = chain_resp['data']['options']
@@ -108,8 +108,7 @@ def check_strategy(fyers, symbol):
         ce = None
         pe = None
         for opt in options:
-            strike = opt.get('strike_price')
-            if strike == atm_strike:
+            if opt.get('strike_price') == atm_strike:
                 opt_type = opt.get('option_type')
                 if opt_type == 'CE':
                     ce = opt
@@ -117,7 +116,7 @@ def check_strategy(fyers, symbol):
                     pe = opt
 
         if not ce or not pe:
-            print(f"No ATM CE/PE {symbol} @ {atm_strike}")
+            print(f"No ATM CE/PE found {symbol} @ {atm_strike}")
             return
 
         # ── SIGNAL ─────────────────────────────────────────────────────────────
@@ -142,7 +141,7 @@ def check_strategy(fyers, symbol):
             sl_pts = 45 if direction == "CE" else 50
 
             print("\n" + "═"*80)
-            print("       ATM MOMENTUM BUY SIGNAL (PAPER)")
+            print("       PAPER SIGNAL - ATM MOMENTUM BUY")
             print("═"*80)
             print(f"Direction  : BUY {direction}")
             print(f"Underlying : {current_price:.2f}")
@@ -154,12 +153,15 @@ def check_strategy(fyers, symbol):
             print(f"Mom 5/10   : {mom5:+.2f}% / {mom10:+.2f}%")
             print("═"*80 + "\n")
 
+            # For tracking in spreadsheet
+            print(f"CSV_LOG,{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{symbol},{direction},{current_price:.2f},{atm_strike},{premium:.1f},{mom5:.2f},{mom10:.2f},{vol_pct:.2f},{lots},{qty}")
+
     except Exception as e:
         print(f"Strategy error {symbol}: {str(e)}")
 
-# ── LOOP & HEALTH ────────────────────────────────────────────────────────────
+# ── MAIN LOOP + HEALTH ───────────────────────────────────────────────────────
 def run_trading_logic():
-    print("=== ATM MOMENTUM OPTION BUYER (PAPER) STARTED ===")
+    print("=== PAPER MODE - ATM MOMENTUM OPTION BUYER STARTED ===")
     fyers = connect_to_fyers()
     if not fyers:
         return
