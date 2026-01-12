@@ -6,17 +6,17 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from fyers_apiv3 import fyersModel
 
-# ── CONFIGURATION ────────────────────────────────────────────────────────────
+# ── CONFIG ───────────────────────────────────────────────────────────────────
 client_id = os.environ.get("FYERS_CLIENT_ID", "").strip()
 access_token = os.environ.get("FYERS_ACCESS_TOKEN", "").strip()
 
 SYMBOLS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]
-TIMEFRAME = "5"                     # Good choice for options context
+TIMEFRAME = "5"
 INITIAL_CAPITAL = 50000
-LOT_SIZE_NIFTY = 25                 # You're using 2026 context → ok
+LOT_SIZE_NIFTY = 25      # your choice for sim; real 2026 ~65 per NSE update
 LOT_SIZE_BANKNIFTY = 15
 
-# ── RISK MANAGEMENT ──────────────────────────────────────────────────────────
+# ── POSITION SIZING ──────────────────────────────────────────────────────────
 def calculate_position_size(current_capital, symbol):
     if current_capital < INITIAL_CAPITAL:
         lots = 1
@@ -24,19 +24,15 @@ def calculate_position_size(current_capital, symbol):
         additional = int((current_capital - INITIAL_CAPITAL) // 100000)
         lots = 1 + additional
 
-    if "NIFTY50" in symbol:
-        qty = lots * LOT_SIZE_NIFTY
-    else:
-        qty = lots * LOT_SIZE_BANKNIFTY
-
+    qty = lots * (LOT_SIZE_NIFTY if "NIFTY50" in symbol else LOT_SIZE_BANKNIFTY)
     return lots, qty
 
-# ── FYERS CONNECTION ─────────────────────────────────────────────────────────
+# ── CONNECT ──────────────────────────────────────────────────────────────────
 def connect_to_fyers():
-    print("Connecting to Fyers API...")
+    print("Connecting to Fyers...")
     try:
         fyers = fyersModel.FyersModel(client_id=client_id, is_async=False,
-                                     token=access_token, log_path="")
+                                      token=access_token, log_path="")
         profile = fyers.get_profile()
         if profile.get("code") == 200:
             print(f"Connected as {profile['data']['name']}")
@@ -48,24 +44,24 @@ def connect_to_fyers():
         print("Connection error:", e)
         return None
 
-# ── MAIN STRATEGY ────────────────────────────────────────────────────────────
+# ── STRATEGY CORE ────────────────────────────────────────────────────────────
 def check_strategy(fyers, symbol):
     try:
         today = datetime.date.today()
         start = today - datetime.timedelta(days=6)
 
-        data = {
+        hist_data = {
             "symbol": symbol,
             "resolution": TIMEFRAME,
-            "date_format": "1",               # ← FIXED: Must be "1" with YYYY-MM-DD
+            "date_format": "1",
             "range_from": start.strftime('%Y-%m-%d'),
             "range_to": today.strftime('%Y-%m-%d'),
             "cont_flag": "1"
         }
 
-        hist = fyers.history(data=data)
+        hist = fyers.history(hist_data)
         if hist.get('s') != 'ok':
-            print(f"History fetch failed for {symbol}: {hist}")
+            print(f"History failed {symbol}: {hist}")
             return
 
         df = pd.DataFrame(hist['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -73,97 +69,107 @@ def check_strategy(fyers, symbol):
 
         current_price = float(df['close'].iloc[-1])
 
-        # Trend
-        df['ema9']  = df['close'].ewm(span=9, adjust=False).mean()
+        # Indicators
+        df['ema9']  = df['close'].ewm(span=9,  adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-
         trend_up   = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
         trend_down = df['ema9'].iloc[-1] < df['ema21'].iloc[-1]
 
-        # Volatility (ATR %)
         tr = pd.concat([df['high'] - df['low'],
                         abs(df['high'] - df['close'].shift()),
                         abs(df['low'] - df['close'].shift())], axis=1).max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
         vol_pct = (atr / current_price) * 100
 
-        # Momentum proxy
-        momentum_5  = (current_price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
-        momentum_10 = (current_price - df['close'].iloc[-10]) / df['close'].iloc[-10] * 100
+        mom5  = (current_price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
+        mom10 = (current_price - df['close'].iloc[-10]) / df['close'].iloc[-10] * 100
 
-        # ── Option Chain ───────────────────────────────────────────────────────
-        chain = fyers.option_chain({"symbol": symbol.replace("-INDEX", "")})
-        if chain.get('code') != 200:
-            print("Option chain failed")
+        # ── OPTION CHAIN (FIXED) ───────────────────────────────────────────────
+        chain_payload = {
+            "symbol": symbol.replace("-INDEX", ""),  # "NIFTY50" or "NIFTYBANK"
+            "strikecount": "10",                     # limited strikes = faster & safer
+            "timestamp": ""
+        }
+
+        chain_resp = fyers.optionchain(chain_payload)
+
+        if chain_resp.get('code') != 200:
+            print(f"Optionchain failed {symbol}: {chain_resp}")
             return
 
-        options = chain['data']['options']
+        if 'data' not in chain_resp or 'options' not in chain_resp['data']:
+            print(f"Invalid optionchain structure {symbol}: {chain_resp}")
+            return
+
+        options = chain_resp['data']['options']
+
         atm_strike = round(current_price / 50) * 50
 
         ce = None
         pe = None
         for opt in options:
-            if opt['strike_price'] == atm_strike:
-                if opt['option_type'] == 'CE':
+            strike = opt.get('strike_price')
+            if strike == atm_strike:
+                opt_type = opt.get('option_type')
+                if opt_type == 'CE':
                     ce = opt
-                elif opt['option_type'] == 'PE':
+                elif opt_type == 'PE':
                     pe = opt
 
         if not ce or not pe:
+            print(f"No ATM CE/PE {symbol} @ {atm_strike}")
             return
 
-        # ── Signal Conditions ──────────────────────────────────────────────────
+        # ── SIGNAL ─────────────────────────────────────────────────────────────
         signal = None
         direction = None
         premium = None
 
-        if (trend_up and momentum_5 > 0.4 and momentum_10 > 0.25 and
-            vol_pct > 0.9 and 60 <= ce.get('ltp', 0) <= 250):
+        if (trend_up and mom5 > 0.4 and mom10 > 0.25 and vol_pct > 0.9 and
+            60 <= ce.get('ltp', 0) <= 250):
             signal = True
             direction = "CE"
             premium = ce.get('ltp', 0)
 
-        elif (trend_down and momentum_5 < -0.4 and momentum_10 < -0.25 and
-              vol_pct > 0.9 and 60 <= pe.get('ltp', 0) <= 250):
+        elif (trend_down and mom5 < -0.4 and mom10 < -0.25 and vol_pct > 0.9 and
+              60 <= pe.get('ltp', 0) <= 250):
             signal = True
             direction = "PE"
             premium = pe.get('ltp', 0)
 
         if signal:
             lots, qty = calculate_position_size(INITIAL_CAPITAL, symbol)
-            sl_points = 45 if direction == "CE" else 50
-            sl_price = current_price - sl_points if direction == "CE" else current_price + sl_points
+            sl_pts = 45 if direction == "CE" else 50
 
-            print("\n" + "═" * 80)
-            print("       ATM DIRECTIONAL OPTION BUY SIGNAL")
-            print("═" * 80)
-            print(f"Direction     : BUY {direction}")
-            print(f"Underlying    : {current_price:.2f}")
-            print(f"ATM Strike    : {atm_strike}")
-            print(f"Premium       : ₹{premium:.1f}")
-            print(f"SL Distance   : {sl_points} points")
-            print(f"Position      : {lots} Lots ({qty} Qty)")
-            print(f"Volatility    : {vol_pct:.1f}%")
-            print(f"Mom 5/10      : {momentum_5:+.2f}% / {momentum_10:+.2f}%")
-            print("═" * 80 + "\n")
+            print("\n" + "═"*80)
+            print("       ATM MOMENTUM BUY SIGNAL (PAPER)")
+            print("═"*80)
+            print(f"Direction  : BUY {direction}")
+            print(f"Underlying : {current_price:.2f}")
+            print(f"Strike     : {atm_strike}")
+            print(f"Premium    : ₹{premium:.1f}")
+            print(f"SL dist    : {sl_pts} pts")
+            print(f"Size       : {lots} lots ({qty} qty)")
+            print(f"Vol %      : {vol_pct:.1f}")
+            print(f"Mom 5/10   : {mom5:+.2f}% / {mom10:+.2f}%")
+            print("═"*80 + "\n")
 
     except Exception as e:
-        print(f"Strategy error {symbol}: {e}")
+        print(f"Strategy error {symbol}: {str(e)}")
 
-# ── MAIN LOOP ────────────────────────────────────────────────────────────────
+# ── LOOP & HEALTH ────────────────────────────────────────────────────────────
 def run_trading_logic():
-    print("=== ATM MOMENTUM OPTION BUYER BOT STARTED ===")
+    print("=== ATM MOMENTUM OPTION BUYER (PAPER) STARTED ===")
     fyers = connect_to_fyers()
     if not fyers:
         return
 
     while True:
         print(f"\nScan at {datetime.datetime.now().strftime('%H:%M:%S')}")
-        for symbol in SYMBOLS:
-            check_strategy(fyers, symbol)
-        time.sleep(300)  # 5 min
+        for sym in SYMBOLS:
+            check_strategy(fyers, sym)
+        time.sleep(300)
 
-# ── HEALTH SERVER ────────────────────────────────────────────────────────────
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
