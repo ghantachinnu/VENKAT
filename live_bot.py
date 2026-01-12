@@ -16,6 +16,11 @@ INITIAL_CAPITAL = 50000
 LOT_SIZE_NIFTY = 25
 LOT_SIZE_BANKNIFTY = 15
 
+# Paper trading simulation settings
+SIMULATED_HOLD_MINUTES = 60          # max hold time
+PROFIT_TARGET_PCT = 80               # +80% profit exit
+STOP_LOSS_PCT = -50                  # -50% loss exit
+
 # ── POSITION SIZING ──────────────────────────────────────────────────────────
 def calculate_position_size(current_capital, symbol):
     if current_capital < INITIAL_CAPITAL:
@@ -23,7 +28,6 @@ def calculate_position_size(current_capital, symbol):
     else:
         additional = int((current_capital - INITIAL_CAPITAL) // 100000)
         lots = 1 + additional
-
     qty = lots * (LOT_SIZE_NIFTY if "NIFTY50" in symbol else LOT_SIZE_BANKNIFTY)
     return lots, qty
 
@@ -44,10 +48,14 @@ def connect_to_fyers():
         print("Connection error:", e)
         return None
 
-# ── STRATEGY ─────────────────────────────────────────────────────────────────
+# ── STRATEGY WITH PAPER SIMULATION ───────────────────────────────────────────
+active_trades = []  # list to track open simulated trades
+
 def check_strategy(fyers, symbol):
+    global active_trades
     try:
-        today = datetime.date.today()
+        now = datetime.datetime.now()
+        today = now.date()
         start = today - datetime.timedelta(days=6)
 
         hist_data = {
@@ -68,13 +76,12 @@ def check_strategy(fyers, symbol):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
 
         if len(df) < 20:
-            print(f"Not enough candles for {symbol}")
             return
 
         current_price = float(df['close'].iloc[-1])
 
         # Indicators
-        df['ema9']  = df['close'].ewm(span=9,  adjust=False).mean()
+        df['ema9']  = df['close'].ewm(span=9, adjust=False).mean()
         df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
         trend_up   = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
         trend_down = df['ema9'].iloc[-1] < df['ema21'].iloc[-1]
@@ -91,95 +98,148 @@ def check_strategy(fyers, symbol):
         # ── OPTION CHAIN ───────────────────────────────────────────────────────
         chain_payload = {
             "symbol": symbol,
-            "strikecount": "20",  # increased to cover more strikes
+            "strikecount": "20",
             "timestamp": ""
         }
 
         chain_resp = fyers.optionchain(chain_payload)
 
         if chain_resp.get('code') != 200:
-            print(f"Optionchain API failed {symbol}: {chain_resp.get('message', chain_resp)}")
+            print(f"Optionchain failed {symbol}: {chain_resp.get('message', chain_resp)}")
             return
 
         if 'data' not in chain_resp or 'optionsChain' not in chain_resp['data']:
-            print(f"Wrong structure in optionchain response {symbol}: {chain_resp}")
+            print(f"Wrong optionchain structure {symbol}")
             return
 
         options = chain_resp['data']['optionsChain']
 
-        # Find closest ATM strike
-        target_strike = round(current_price / 50) * 50
-        closest_strike = min(options, key=lambda x: abs(x.get('strike_price', 0) - target_strike))
-        atm_strike = closest_strike.get('strike_price')
+        # Find closest ATM
+        target = round(current_price / 50) * 50
+        closest = min(options, key=lambda x: abs(x.get('strike_price', 0) - target))
+        atm_strike = closest.get('strike_price')
 
         ce = None
         pe = None
         for opt in options:
             if opt.get('strike_price') == atm_strike:
-                opt_type = opt.get('option_type')
-                if opt_type == 'CE':
+                if opt.get('option_type') == 'CE':
                     ce = opt
-                elif opt_type == 'PE':
+                elif opt.get('option_type') == 'PE':
                     pe = opt
 
         if not ce or not pe:
-            print(f"No CE/PE found at strike {atm_strike} for {symbol}")
             return
 
-        # ── SIGNAL ─────────────────────────────────────────────────────────────
-        signal = None
+        # ── SIGNAL DETECTION ───────────────────────────────────────────────────
         direction = None
         premium = None
 
         if (trend_up and mom5 > 0.4 and mom10 > 0.25 and vol_pct > 0.9 and
             60 <= ce.get('ltp', 0) <= 250):
-            signal = True
             direction = "CE"
             premium = ce.get('ltp', 0)
 
         elif (trend_down and mom5 < -0.4 and mom10 < -0.25 and vol_pct > 0.9 and
               60 <= pe.get('ltp', 0) <= 250):
-            signal = True
             direction = "PE"
             premium = pe.get('ltp', 0)
 
-        if signal:
+        if direction:
             lots, qty = calculate_position_size(INITIAL_CAPITAL, symbol)
-            sl_pts = 45 if direction == "CE" else 50
+
+            trade = {
+                'entry_time': now,
+                'symbol': symbol,
+                'direction': direction,
+                'underlying': current_price,
+                'strike': atm_strike,
+                'entry_premium': premium,
+                'lots': lots,
+                'qty': qty,
+                'status': 'OPEN'
+            }
+            active_trades.append(trade)
 
             print("\n" + "═"*80)
-            print("       PAPER SIGNAL - ATM MOMENTUM BUY")
+            print("       NEW PAPER TRADE OPENED")
             print("═"*80)
+            print(f"Time        : {now.strftime('%H:%M:%S')}")
             print(f"Direction   : BUY {direction}")
             print(f"Underlying  : {current_price:.2f}")
             print(f"Strike      : {atm_strike}")
-            print(f"Premium     : ₹{premium:.1f}")
-            print(f"SL distance : {sl_pts} pts")
+            print(f"Entry Prem  : ₹{premium:.1f}")
             print(f"Position    : {lots} lots ({qty} qty)")
-            print(f"Volatility  : {vol_pct:.1f}%")
-            print(f"Momentum    : {mom5:+.2f}% / {mom10:+.2f}%")
             print("═"*80 + "\n")
 
-            # Easy copy to spreadsheet
-            print(f"CSV_LOG,{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{symbol},{direction},{current_price:.2f},{atm_strike},{premium:.1f},{mom5:.2f},{mom10:.2f},{vol_pct:.2f},{lots},{qty}")
+            print(f"CSV_ENTRY,{now.strftime('%Y-%m-%d %H:%M:%S')},{symbol},{direction},{current_price:.2f},{atm_strike},{premium:.1f},{lots},{qty}")
+
+        # ── CHECK EXISTING PAPER TRADES FOR EXIT ───────────────────────────────
+        trades_to_close = []
+        for trade in active_trades:
+            if trade['status'] != 'OPEN':
+                continue
+
+            minutes_held = (now - trade['entry_time']).total_seconds() / 60
+
+            # Very rough exit approximation (no real LTP fetch)
+            # In real code you would poll option chain again for current LTP
+            current_premium = trade['entry_premium']  # assume no movement (conservative)
+
+            pnl_pct = ((current_premium - trade['entry_premium']) / trade['entry_premium']) * 100 if trade['entry_premium'] > 0 else 0
+
+            exit_reason = None
+            if pnl_pct >= PROFIT_TARGET_PCT:
+                exit_reason = f"PROFIT TARGET +{PROFIT_TARGET_PCT}%"
+            elif pnl_pct <= STOP_LOSS_PCT:
+                exit_reason = f"STOP LOSS {STOP_LOSS_PCT}%"
+            elif minutes_held >= SIMULATED_HOLD_MINUTES:
+                exit_reason = f"HOLD TIME {SIMULATED_HOLD_MINUTES} min"
+
+            if exit_reason:
+                pnl_points = current_premium - trade['entry_premium']
+                pnl_rupees = pnl_points * trade['qty']
+
+                print("\n" + "═"*80)
+                print("       PAPER TRADE CLOSED")
+                print("═"*80)
+                print(f"Entry time  : {trade['entry_time'].strftime('%H:%M:%S')}")
+                print(f"Direction   : {trade['direction']}")
+                print(f"Strike      : {trade['strike']}")
+                print(f"Entry Prem  : ₹{trade['entry_premium']:.1f}")
+                print(f"Exit Prem   : ₹{current_premium:.1f} (approx)")
+                print(f"PnL points  : {pnl_points:+.1f}")
+                print(f"PnL rupees  : ₹{pnl_rupees:+,.0f}")
+                print(f"Reason      : {exit_reason}")
+                print("═"*80 + "\n")
+
+                print(f"CSV_EXIT,{now.strftime('%Y-%m-%d %H:%M:%S')},{trade['symbol']},{trade['direction']},{pnl_points:.1f},{pnl_rupees:+,.0f},{exit_reason}")
+
+                trade['status'] = 'CLOSED'
+                trades_to_close.append(trade)
+
+        # Clean up closed trades
+        for t in trades_to_close:
+            active_trades.remove(t)
 
     except Exception as e:
-        print(f"ERROR in strategy for {symbol}: {str(e)}")
+        print(f"ERROR {symbol}: {str(e)}")
 
-# ── MAIN LOOP + HEALTH SERVER ────────────────────────────────────────────────
+# ── MAIN LOOP ────────────────────────────────────────────────────────────────
 def run_trading_logic():
-    print("=== PAPER MODE - ATM MOMENTUM OPTION BUYER STARTED ===")
+    print("=== PAPER TRADING SIMULATION STARTED ===")
+    print(f"Simulation rules: max hold {SIMULATED_HOLD_MINUTES} min | TP {PROFIT_TARGET_PCT}% | SL {STOP_LOSS_PCT}%")
     fyers = connect_to_fyers()
     if not fyers:
-        print("Cannot start - connection failed")
         return
 
     while True:
         print(f"\nScan at {datetime.datetime.now().strftime('%H:%M:%S')}")
         for sym in SYMBOLS:
             check_strategy(fyers, sym)
-        time.sleep(300)
+        time.sleep(300)  # 5 minutes
 
+# ── HEALTH SERVER ────────────────────────────────────────────────────────────
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -189,7 +249,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"Health server listening on port {port}")
+    print(f"Health server on port {port}")
     server.serve_forever()
 
 if __name__ == "__main__":
