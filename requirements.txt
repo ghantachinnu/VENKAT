@@ -2,3 +2,5 @@ fyers-apiv3
 pandas
 numpy
 requests
+py_vollib
+setuptools
