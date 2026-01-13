@@ -2,8 +2,9 @@
 # Nifty Monthly Options Buyer - Simulation / Forward Test
 # Fixed for Render: Added Web Server & Fixed Option Chain Types
 # TARGET: Late February Monthly Expiry (Automatic Roll)
-# DEBUGGED: Fixed "'str' object cannot be interpreted as an integer" in fallback logic.
+# DEBUGGED: Fixed "'str' object cannot be interpreted as an integer" crash.
 # FIXED: Symbol matching now uses float-safe strike comparison and robust name detection.
+# ADDED: HEAD support for Render health checks.
 
 import time
 import datetime
@@ -193,6 +194,7 @@ def get_greeks(flag, spot, strike, dte, iv_pct, r=0.065, q=0.012):
             'vega': round(vega(flag, spot, strike, t, r, sigma), 2)
         }
     except Exception as e:
+        print("Greeks calculation failed:", e)
         return {'delta': None, 'gamma': None, 'theta_daily': None, 'vega': None}
 
 def filter_entry(greeks, premium, iv, dte):
@@ -359,7 +361,7 @@ def try_entry():
                 virtual_positions.append(entry_record)
                 print(f"✅ [SIM ENTRY SUCCESS] {final_symbol} @ ₹{premium:.1f}")
             else:
-                print("[LIVE MODE] Entry logic would fire order here.")
+                print("[LIVE MODE] Order logic would trigger here.")
             save_state()
             
         else:
@@ -367,7 +369,7 @@ def try_entry():
             return
             
     except Exception as e:
-        print("Logic Execution Error:", e)
+        print("Logic Execution Error:", str(e))
         return
 
 # ────────────────────────────────────────────────
