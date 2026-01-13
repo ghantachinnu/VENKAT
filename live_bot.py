@@ -127,7 +127,7 @@ def get_last_tuesday_dte():
         next_month = datetime.date(y, m + 1, 1)
         
     last_day = next_month - datetime.timedelta(days=1)
-    offset = (last_day.weekday() - 1) % 7  # Tuesday = 1
+    offset = (last_day.weekday() - 1) % 7 
     last_tue = last_day - datetime.timedelta(days=offset)
     if last_tue.month != m:
         last_tue -= datetime.timedelta(days=7)
@@ -257,14 +257,14 @@ def try_entry():
         return
         
     try:
-        # FIXED: Removed timestamp="", strikecount=1 (Integer)
+        # FIXED: strikecount MUST be a number (1), not an empty string ("")
         exp_resp = fyers.optionchain({"symbol": "NSE:NIFTY50-INDEX", "strikecount": 1})
         
         if exp_resp.get('s') == 'ok':
             expiries = exp_resp['data']['expiryData']
             expiry_code = None
             for exp in expiries:
-                exp_date = datetime.datetime.fromtimestamp(exp['expiry'])
+                exp_date = datetime.datetime.fromtimestamp(int(exp['expiry']))
                 dte = (exp_date - datetime.datetime.now()).days
                 if dte >= MIN_DTE_AT_ENTRY:
                     expiry_code = exp_date.strftime('%d%b').upper()
@@ -323,11 +323,11 @@ def try_entry():
 # MAIN THREADS
 # ────────────────────────────────────────────────
 def run_bot_logic():
-    print("Nifty Monthly Option Buyer - Simulation Mode")
+    print("Nifty Monthly Option Buyer - Simulation Mode Started")
     load_state()
     while True:
         try:
-            print(f"Scanning... {datetime.datetime.now()}")
+            print(f"Scanning... {datetime.datetime.now().strftime('%H:%M:%S')}")
             if can_trade():
                 try_entry()
             manage_positions()
@@ -336,10 +336,10 @@ def run_bot_logic():
             print("Main loop error:", e)
         time.sleep(300)
 
-# --- DUMMY WEB SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.end_headers()
         self.wfile.write(b"Bot is running")
 
 def start_web_server():
