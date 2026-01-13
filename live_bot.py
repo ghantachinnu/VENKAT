@@ -1,24 +1,24 @@
 # main_strategy.py
 # Nifty Monthly Options Buyer - Simulation / Forward Test
-# For Render Background Worker - hands-off automation
+# Fixed for Render - polling version (no WebSocket issues)
+
 import time
 import datetime
 import json
 import os
 from fyers_apiv3 import fyersModel
-from fyers_apiv3.FyersWebsocket import data_ws
 from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
-import numpy as np  # for any math
 
 # ────────────────────────────────────────────────
 # CONFIG
 # ────────────────────────────────────────────────
-SIMULATION_MODE = True  # Flip to False for real trades (after simulation)
+SIMULATION_MODE = True  # Change to False only when ready for real trades (after 3–6 months simulation)
 CAPITAL = 100000.0
-LOT_SIZE = 65  # 2026 Nifty lot size
+LOT_SIZE = 65  # Nifty lot size in 2026
 MAX_TRADES_PER_MONTH = 8
 SL_POINTS = 60
 SLIPPAGE_POINTS = 2.0 if not SIMULATION_MODE else 0.0
+
 # Trailing upgrades (premium multiples)
 RR_UPGRADE_1 = 1.5  # breakeven + buffer
 RR_UPGRADE_2 = 1.7  # loose trail
@@ -26,12 +26,13 @@ RR_TARGET = 2.0  # tight trail
 BREAKEVEN_BUFFER = 8
 TRAIL_LOOSE_POINTS = 35
 TRAIL_TIGHT_POINTS = 20
-# Greeks thresholds
+
+# Greeks thresholds (monthly rhythm focus)
 DELTA_MIN = 0.42
 DELTA_MAX = 0.62
 GAMMA_MIN = 0.010
 GAMMA_MAX = 0.028
-THETA_MIN = -1.60  # least negative
+THETA_MIN = -1.60  # least negative = slower decay
 THETA_MAX = -0.70
 VEGA_MIN = 10
 VEGA_MAX = 28
@@ -40,15 +41,24 @@ IV_MAX = 21.5
 MIN_PREMIUM = 90
 MAX_PREMIUM = 380
 MIN_DTE_AT_ENTRY = 22
-# Avoid last week
+
+# Avoid last week of month
 AVOID_LAST_WEEK_DAYS = 7
-# Files for persistence on Render (use /data if mounted, else current dir)
+
+# Files (Render current dir – no special mount needed)
 STATE_FILE = "strategy_state.json"
 TRADE_LOG_FILE = "trade_log.json"
-# Fyers credentials from env vars
-CLIENT_ID = os.getenv("FYERS_CLIENT_ID", "YOUR_CLIENT_ID")
-ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN")
-fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, log_path="logs/")
+
+# Fyers credentials from Render Environment Variables
+CLIENT_ID = os.getenv("FYERS_CLIENT_ID", "").strip()
+ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN", "").strip()
+
+# Connect with log_path fixed
+fyers = fyersModel.FyersModel(
+    client_id=CLIENT_ID,
+    token=ACCESS_TOKEN,
+    log_path="./"  # FIXED: logs go to current directory – no folder needed
+)
 
 # ────────────────────────────────────────────────
 # STATE
@@ -73,7 +83,7 @@ def load_state():
             equity_curve = data.get('equity_curve', [CAPITAL])
         print(f"Loaded state | Open: {len(virtual_positions)} | Closed: {len(trade_history)}")
     else:
-        print("No state file found – starting fresh")
+        print("No state file – starting fresh")
 
 def save_state():
     data = {
@@ -86,7 +96,7 @@ def save_state():
     }
     with open(STATE_FILE, 'w') as f:
         json.dump(data, f, default=str)
-    print("Saved state")
+    print("State saved")
 
 def log_trade(trade):
     with open(TRADE_LOG_FILE, 'a') as f:
@@ -101,7 +111,7 @@ def is_new_month():
         consec_losses = 0
         current_month = m
         save_state()
-        print(f"New month: {current_month}")
+        print(f"New month started: {current_month}")
 
 def get_last_tuesday_dte():
     now = datetime.date.today()
@@ -121,7 +131,7 @@ def can_trade():
         print("Monthly cap reached")
         return False
     if consec_losses >= 3:
-        print("3 losses → paused")
+        print("3 consecutive losses → paused")
         return False
     dte = get_last_tuesday_dte()
     if dte <= AVOID_LAST_WEEK_DAYS:
@@ -132,24 +142,24 @@ def can_trade():
 def get_spot():
     try:
         resp = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-        if resp['s'] == 'ok':
+        if resp.get('s') == 'ok':
             return resp['d'][0]['v']['lp']
-    except:
-        pass
+    except Exception as e:
+        print("Spot fetch error:", e)
     return None
 
 def get_option_quote(symbol):
     try:
         resp = fyers.quotes({"symbols": symbol})
-        if resp['s'] == 'ok':
+        if resp.get('s') == 'ok':
             d = resp['d'][0]['v']
             return {
                 'ltp': d.get('lp', 0),
                 'iv': d.get('impliedVolatility', 0),
                 'oi': d.get('oi', 0)
             }
-    except:
-        pass
+    except Exception as e:
+        print("Quote error:", e)
     return None
 
 def get_greeks(flag, spot, strike, dte, iv_pct, r=0.065, q=0.012):
@@ -161,10 +171,11 @@ def get_greeks(flag, spot, strike, dte, iv_pct, r=0.065, q=0.012):
         return {
             'delta': round(delta(flag, spot, strike, t, r, sigma), 4),
             'gamma': round(gamma(flag, spot, strike, t, r, sigma), 4),
-            'theta_daily': round(theta(flag, spot, strike, t, r, sigma) * 365, 3),  # corrected to daily
+            'theta_daily': round(theta(flag, spot, strike, t, r, sigma) * 365, 3),  # daily theta
             'vega': round(vega(flag, spot, strike, t, r, sigma), 2)
         }
-    except:
+    except Exception as e:
+        print("Greeks calc error:", e)
         return {'delta': None, 'gamma': None, 'theta_daily': None, 'vega': None}
 
 def filter_entry(greeks, premium, iv, dte):
@@ -180,9 +191,9 @@ def filter_entry(greeks, premium, iv, dte):
         dte >= MIN_DTE_AT_ENTRY
     )
     if not ok:
-        print(f"Filter fail | Δ:{greeks['delta']} Γ:{greeks['gamma']} Θ:{greeks['theta_daily']} IV:{iv} DTE:{dte}")
+        print(f"Filter fail → Δ:{greeks['delta']} Γ:{greeks['gamma']} Θ:{greeks['theta_daily']} IV:{iv} DTE:{dte}")
     else:
-        print("Entry filter OK")
+        print("Entry filter PASS")
     return ok
 
 # ────────────────────────────────────────────────
@@ -199,7 +210,7 @@ def manage_positions():
         ltp = quote['ltp']
         pnl_points = ltp - pos['entry_premium']
         pnl_rs = pnl_points * LOT_SIZE
-        # SL check
+        # SL hit
         if ltp <= pos['current_sl']:
             pos['status'] = 'closed_sl'
             pos['exit_premium'] = ltp
@@ -212,7 +223,7 @@ def manage_positions():
             virtual_positions.remove(pos)
             save_state()
             continue
-        # Trailing
+        # Trailing logic
         mult = ltp / pos['entry_premium'] if pos['entry_premium'] > 0 else 0
         if mult >= RR_TARGET:
             new_sl = ltp - TRAIL_TIGHT_POINTS
@@ -224,36 +235,7 @@ def manage_positions():
             new_sl = pos['current_sl']
         if new_sl > pos['current_sl']:
             pos['current_sl'] = new_sl
-            print(f"[SIM TRAIL] {pos['symbol']} SL to {new_sl:.1f} mult {mult:.2f}x")
-
-# ────────────────────────────────────────────────
-# WEBSOCKET
-# ────────────────────────────────────────────────
-def on_message(ws, message):
-    try:
-        data = json.loads(message)
-        if 'symbol' in data and 'ltp' in data:
-            symbol = data['symbol']
-            ltp = data['ltp']
-            print(f"Tick {symbol} {ltp:.1f}")
-            manage_positions()  # check trailing/SL on every tick
-    except Exception as e:
-        print("WS message error:", e)
-
-def on_open(ws):
-    symbols = ["NSE:NIFTY50-INDEX"]
-    for p in virtual_positions:
-        if p['status'] == 'open':
-            symbols.append(p['symbol'])
-    if symbols:
-        ws.subscribe(symbols=symbols, data_type="SymbolUpdate")
-        print(f"Subscribed to {len(symbols)} symbols")
-
-def on_error(ws, message):
-    print("WS error:", message)
-
-def on_close(ws):
-    print("WS closed")
+            print(f"[SIM TRAIL] {pos['symbol']} new SL: {new_sl:.1f} mult: {mult:.2f}x")
 
 # ────────────────────────────────────────────────
 # ENTRY LOGIC
@@ -264,23 +246,27 @@ def try_entry():
     spot = get_spot()
     if not spot:
         return
-    # Get monthly expiry from Fyers (first expiry > MIN_DTE_AT_ENTRY)
+    # Get monthly expiry (first expiry >= MIN_DTE_AT_ENTRY)
     try:
         exp_resp = fyers.optionchain({"symbol": "NSE:NIFTY50-INDEX", "strikecount": "", "timestamp": ""})
-        if exp_resp['s'] == 'ok':
+        if exp_resp.get('s') == 'ok':
             expiries = exp_resp['data']['expiryData']
+            expiry_code = None
             for exp in expiries:
                 exp_date = datetime.datetime.fromtimestamp(exp['expiry'])
                 dte = (exp_date - datetime.datetime.now()).days
                 if dte >= MIN_DTE_AT_ENTRY:
                     expiry_code = exp_date.strftime('%d%b').upper()
                     break
-    except:
-        print("Expiry fetch fail")
+            if not expiry_code:
+                print("No suitable monthly expiry found")
+                return
+    except Exception as e:
+        print("Expiry fetch failed:", e)
         return
-    # Slight OTM call (change to PE for put)
-    strike = round(spot / 50) * 50 + 100  # OTM example
-    symbol = f"NSE:NIFTY{expiry_code}{int(strike)}CE"  # or PE
+    # Slight OTM call example (change to PE if you want puts)
+    strike = round(spot / 50) * 50 + 100  # OTM call
+    symbol = f"NSE:NIFTY{expiry_code}{int(strike)}CE"
     quote = get_option_quote(symbol)
     if not quote or quote['ltp'] < MIN_PREMIUM:
         return
@@ -290,11 +276,11 @@ def try_entry():
     greeks = get_greeks('c', spot, strike, dte, iv)
     if not filter_entry(greeks, premium, iv, dte):
         return
-    # Momentum check (REPLACE WITH YOUR REAL 5-MIN BREAKOUT + VOLUME LOGIC)
-    momentum_ok = True  # placeholder
+    # Momentum check (placeholder – replace with your real 5-min breakout logic)
+    momentum_ok = True
     if not momentum_ok:
         return
-    # Entry
+    # Entry!
     global monthly_trades, consec_losses
     monthly_trades += 1
     consec_losses = 0
@@ -314,29 +300,21 @@ def try_entry():
         virtual_positions.append(entry_record)
         print(f"[SIM ENTRY] {symbol} @ {premium:.1f} SL {sl_premium:.1f}")
     else:
-        # Real order (add fyers.place_order logic here when ready)
-        print("[LIVE ENTRY] Would place order")
+        print("[LIVE ENTRY] Would place buy order here – add fyers.place_order() when ready")
     save_state()
 
 # ────────────────────────────────────────────────
-# MAIN
+# MAIN LOOP
 # ────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Nifty Monthly Option Buyer - Simulation Mode")
     load_state()
-    # Websocket setup
-    ws = data_ws.FyersDataWebSocket(access_token=ACCESS_TOKEN, log_level="ERROR")
-    ws.on_message = on_message
-    ws.on_open = on_open
-    ws.on_error = on_error
-    ws.on_close = on_close
-    ws.connect()
-    # Main loop for entry checks
     while True:
         try:
-            try_entry()
+            if can_trade():
+                try_entry()
             manage_positions()
             save_state()
         except Exception as e:
-            print("Loop error:", e)
-        time.sleep(300)  # 5 min
+            print("Main loop error:", e)
+        time.sleep(300)  # 5 minutes
