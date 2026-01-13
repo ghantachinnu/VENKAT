@@ -1,6 +1,7 @@
 # main_strategy.py
 # Nifty Monthly Options Buyer - Simulation / Forward Test
 # Fixed for Render: Added Web Server & Fixed Option Chain Types
+# ADDED: Tracking lines to see Nifty Price and Filter status in logs.
 
 import time
 import datetime
@@ -200,7 +201,8 @@ def filter_entry(greeks, premium, iv, dte):
         dte >= MIN_DTE_AT_ENTRY
     )
     if not ok:
-        print(f"Filter fail: D:{greeks['delta']} G:{greeks['gamma']} T:{greeks['theta_daily']}")
+        # User already has this debug line, keeping it
+        print(f"Filter fail: D:{greeks['delta']} G:{greeks['gamma']} T:{greeks['theta_daily']} IV:{iv} Prem:{premium}")
     else:
         print("Entry filter PASS")
     return ok
@@ -255,6 +257,9 @@ def try_entry():
     spot = get_spot()
     if not spot:
         return
+    
+    # TRACKING: Show the spot price found
+    print(f"--- SCANNING: Nifty Spot is {spot} ---")
         
     try:
         # FIXED: strikecount MUST be a number (1), not an empty string ("")
@@ -268,9 +273,11 @@ def try_entry():
                 dte = (exp_date - datetime.datetime.now()).days
                 if dte >= MIN_DTE_AT_ENTRY:
                     expiry_code = exp_date.strftime('%d%b').upper()
+                    # TRACKING: Show what expiry the bot selected
+                    print(f"Selected Expiry: {expiry_code} ({dte} days to go)")
                     break
             if not expiry_code:
-                print("No suitable monthly expiry found")
+                print("No suitable monthly expiry found (DTE < 22)")
                 return
         else:
             print("Option chain error:", exp_resp)
@@ -282,15 +289,23 @@ def try_entry():
 
     strike = round(spot / 50) * 50 + 100
     symbol = f"NSE:NIFTY{expiry_code}{int(strike)}CE"
+    
+    # TRACKING: Show what symbol the bot is checking
+    print(f"Checking Symbol: {symbol}")
+    
     quote = get_option_quote(symbol)
     
     if not quote or quote['ltp'] < MIN_PREMIUM:
+        if quote: print(f"Skipping: {symbol} premium too low ({quote['ltp']})")
         return
         
     premium = quote['ltp']
     iv = quote['iv']
     dte = get_last_tuesday_dte()
     greeks = get_greeks('c', spot, strike, dte, iv)
+    
+    # TRACKING: Show the Greeks results
+    print(f"Greeks for {symbol}: Delta: {greeks.get('delta')}, IV: {iv}")
     
     if not filter_entry(greeks, premium, iv, dte):
         return
@@ -314,7 +329,7 @@ def try_entry():
     
     if SIMULATION_MODE:
         virtual_positions.append(entry_record)
-        print(f"[SIM ENTRY] {symbol} @ {premium:.1f} SL {sl_premium:.1f}")
+        print(f"✅ [SIM ENTRY] {symbol} @ {premium:.1f} SL {sl_premium:.1f}")
     else:
         print("[LIVE ENTRY] Would place buy order here")
     save_state()
@@ -327,7 +342,7 @@ def run_bot_logic():
     load_state()
     while True:
         try:
-            print(f"Scanning... {datetime.datetime.now().strftime('%H:%M:%S')}")
+            print(f"\nScan at {datetime.datetime.now().strftime('%H:%M:%S')}")
             if can_trade():
                 try_entry()
             manage_positions()
