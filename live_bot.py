@@ -3,7 +3,7 @@
 # Fixed for Render: Added Web Server & Fixed Option Chain Types
 # TARGET: Late February Monthly Expiry (Automatic Roll)
 # DEBUGGED: Fixed "'str' object cannot be interpreted as an integer" in fallback logic.
-# FIXED: Removed broken lib_greeks import to prevent ModuleNotFoundError.
+# FIXED: Symbol matching now uses float-safe strike comparison and robust name detection.
 
 import time
 import datetime
@@ -272,50 +272,57 @@ def try_entry():
             expiries = exp_resp['data']['expiryData']
             target_ts = None
             target_dte = 0
-            expiry_code = ""
+            expiry_month_name = ""
+            expiry_year_code = ""
+
             for exp in expiries:
-                # FORCE INT to avoid the string error
-                exp_val = int(exp['expiry'])
+                # FORCE CONVERSION TO INT to fix 'str object cannot be interpreted as integer'
+                try:
+                    exp_val = int(float(exp['expiry'])) 
+                except:
+                    continue
+                    
                 exp_date = datetime.datetime.fromtimestamp(exp_val)
                 dte = (exp_date - datetime.datetime.now()).days
                 if dte >= MIN_DTE_AT_ENTRY:
                     target_ts = exp_val
                     target_dte = dte
-                    expiry_code = exp_date.strftime('%d%b').upper()
-                    print(f"Selected Expiry: {expiry_code} ({target_dte} days left)")
+                    expiry_month_name = exp_date.strftime('%b').upper() # e.g. "FEB"
+                    expiry_year_code = exp_date.strftime('%y')         # e.g. "26"
+                    print(f"Selected Expiry: {exp_date.strftime('%d%b')} ({target_dte} days left)")
                     break
             
             if not target_ts:
                 print(f"No suitable monthly expiry found (DTE < {MIN_DTE_AT_ENTRY})")
                 return
 
-            target_strike = round(spot / 50) * 50 
+            # Target ATM Strike
+            target_strike = int(round(spot / 50) * 50)
             final_symbol = None
             options_list = exp_resp['data']['optionsChain']
             
-            # Robust Detection matching internal ID and Strike
+            # --- IMPROVED ROBUST SYMBOL MATCHING ---
             for opt in options_list:
-                if (int(opt.get('expiry', 0)) == target_ts and 
-                    int(opt.get('strike_price', 0)) == int(target_strike) and 
-                    opt.get('option_type') == 'CE'):
-                    final_symbol = opt.get('symbol')
-                    break
-            
-            # Fallback using Month/Year name
-            if not final_symbol:
-                dt_obj = datetime.datetime.fromtimestamp(int(target_ts))
-                m_str = dt_obj.strftime('%b').upper()
-                y_str = dt_obj.strftime('%y')
-                for opt in options_list:
-                    s_str = opt.get('symbol', '')
-                    if (int(opt.get('strike_price', 0)) == int(target_strike) and 
-                        opt.get('option_type') == 'CE' and 
-                        m_str in s_str and y_str in s_str):
-                        final_symbol = opt.get('symbol')
+                # Get strike and expiry safely as integers
+                opt_strike = int(float(opt.get('strike_price', 0)))
+                opt_expiry = int(float(opt.get('expiry', 0)))
+                opt_type = opt.get('option_type', '')
+                opt_symbol = opt.get('symbol', '')
+
+                # Match Strike and Type first
+                if opt_strike == target_strike and opt_type == 'CE':
+                    # Check 1: Match by exact timestamp (Best)
+                    if opt_expiry == target_ts:
+                        final_symbol = opt_symbol
+                        break
+                    # Check 2: Match by Month/Year in string (Fallback for Monthlies)
+                    # Monthly format: NIFTY26FEB25750CE
+                    if expiry_month_name in opt_symbol and expiry_year_code in opt_symbol:
+                        final_symbol = opt_symbol
                         break
 
             if not final_symbol:
-                print(f"DEBUG: Could not find exact symbol for {target_strike} CE in chain.")
+                print(f"DEBUG: Could not find symbol for {target_strike} CE for {expiry_month_name}")
                 return
 
             print(f"Checking Real Symbol: {final_symbol}")
@@ -372,7 +379,7 @@ def run_bot_logic():
     while True:
         try:
             now = datetime.datetime.now()
-            # Market Hours (9:15 to 3:30)
+            # Indian Market Hours (9:15 to 3:30)
             if (now.hour == 9 and now.minute >= 15) or (10 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30):
                 print(f"\nScan at {now.strftime('%H:%M:%S')}")
                 if can_trade():
@@ -384,7 +391,7 @@ def run_bot_logic():
                     print(f"Market Closed. Current Time: {now.strftime('%H:%M:%S')}")
         except Exception as e:
             print("Main loop error:", e)
-        time.sleep(300) # 5 minutes
+        time.sleep(300) # Scan every 5 minutes
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
