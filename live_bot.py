@@ -3,6 +3,7 @@
 # Fixed for Render: Added Web Server & Fixed Option Chain Types
 # TARGET: Late February Monthly Expiry (Automatic Roll)
 # DEBUGGED: Robust Symbol Matching to fix "Could not find symbol" or "0 Premium" errors.
+# FIXED: Removed broken lib_greeks import to prevent ModuleNotFoundError.
 
 import time
 import datetime
@@ -11,7 +12,7 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from fyers_apiv3 import fyersModel
-from py_vollib.black_scholes.get_greeks import get_greeks as lib_greeks
+# Importing analytical Greeks directly to avoid ModuleNotFoundError
 from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
 
 # ────────────────────────────────────────────────
@@ -41,6 +42,7 @@ THETA_MIN = -1.60
 THETA_MAX = -0.70
 VEGA_MIN = 10
 VEGA_MAX = 28
+# IV Range
 IV_MIN = 13
 IV_MAX = 21.5
 
@@ -51,6 +53,7 @@ MAX_PREMIUM = 550 # Increased to catch Monthly ATM (currently ~385)
 # --- DYNAMIC EXPIRY SELECTION ---
 # Setting this to 40 ensures the bot skips immediate weeklies and targets the Month-End contract.
 # As today is Jan 13, 40 days lands on Feb 26 (Monthly Expiry).
+# It will automatically roll to March once February is less than 40 days away.
 MIN_DTE_AT_ENTRY = 40 
 
 # Avoid last week of month
@@ -191,6 +194,7 @@ def get_greeks(flag, spot, strike, dte, iv_pct, r=0.065, q=0.012):
             'vega': round(vega(flag, spot, strike, t, r, sigma), 2)
         }
     except Exception as e:
+        print("Greeks calculation failed:", e)
         return {'delta': None, 'gamma': None, 'theta_daily': None, 'vega': None}
 
 def filter_entry(greeks, premium, iv, dte):
@@ -200,6 +204,7 @@ def filter_entry(greeks, premium, iv, dte):
         DELTA_MIN <= greeks['delta'] <= DELTA_MAX and
         GAMMA_MIN <= greeks['gamma'] <= GAMMA_MAX and
         THETA_MIN <= greeks['theta_daily'] <= THETA_MAX and
+        VEGA_MIN <= greeks['vega'] <= VEGA_MAX and
         IV_MIN <= iv <= IV_MAX and
         MIN_PREMIUM <= premium <= MAX_PREMIUM and
         dte >= MIN_DTE_AT_ENTRY
@@ -287,22 +292,21 @@ def try_entry():
                 print(f"No suitable monthly expiry found (DTE < {MIN_DTE_AT_ENTRY})")
                 return
 
-            # Target ATM Strike (The most reliable strike for far-dated contracts)
+            # Target ATM Strike
             target_strike = round(spot / 50) * 50 
             
-            # IMPROVED DETECTION: Find symbol by matching the exact internal Expiry ID
+            # IMPROVED DETECTION: Use internal Expiry ID and Strike Price
             final_symbol = None
             options_list = exp_resp['data']['optionsChain']
             
             for opt in options_list:
-                # Match by Expiry Timestamp (Most reliable), Strike, and Type
                 if (opt.get('expiry') == target_ts and 
                     int(opt.get('strike_price', 0)) == int(target_strike) and 
                     opt.get('option_type') == 'CE'):
                     final_symbol = opt.get('symbol')
                     break
             
-            # FALLBACK: If timestamp key is missing, match by name code
+            # FALLBACK: Match by month/year name code if timestamp key is wonky
             if not final_symbol:
                 month_str = datetime.datetime.fromtimestamp(target_ts).strftime('%b').upper()
                 year_str = datetime.datetime.fromtimestamp(target_ts).strftime('%y')
@@ -318,7 +322,6 @@ def try_entry():
                 print(f"DEBUG: Could not find exact symbol for {target_strike} CE in chain list.")
                 return
 
-            # TRACKING: Show the real symbol and price found
             print(f"Checking Real Symbol: {final_symbol}")
             quote = get_option_quote(final_symbol)
             if not quote: return
@@ -367,7 +370,7 @@ def try_entry():
             return
             
     except Exception as e:
-        print("Detailed Entry Error:", e)
+        print("Logic Execution Error:", e)
         return
 
 # ────────────────────────────────────────────────
@@ -388,7 +391,7 @@ def run_bot_logic():
                 save_state()
             else:
                 if now.minute % 30 == 0:
-                    print(f"Market Closed. Time: {now.strftime('%H:%M:%S')}")
+                    print(f"Market Closed. Current Time: {now.strftime('%H:%M:%S')}")
         except Exception as e:
             print("Main loop error:", e)
         time.sleep(300) # Scan every 5 minutes
