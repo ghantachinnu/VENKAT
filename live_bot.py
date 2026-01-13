@@ -2,7 +2,7 @@
 # Nifty Monthly Options Buyer - Simulation / Forward Test
 # Fixed for Render: Added Web Server & Fixed Option Chain Types
 # TARGET: Late February Monthly Expiry (Automatic Roll)
-# DEBUGGED: Robust Symbol Matching to fix "Could not find symbol" or "0 Premium" errors.
+# DEBUGGED: Fixed "'str' object cannot be interpreted as an integer" in fallback logic.
 # FIXED: Removed broken lib_greeks import to prevent ModuleNotFoundError.
 
 import time
@@ -12,7 +12,7 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from fyers_apiv3 import fyersModel
-# Importing analytical Greeks directly to avoid ModuleNotFoundError
+# Importing analytical Greeks directly for maximum stability
 from py_vollib.black_scholes.greeks.analytical import delta, gamma, theta, vega
 
 # ────────────────────────────────────────────────
@@ -48,12 +48,11 @@ IV_MAX = 21.5
 
 # Premium Range
 MIN_PREMIUM = 30  
-MAX_PREMIUM = 550 # Increased to catch Monthly ATM (currently ~385)
+MAX_PREMIUM = 550 # Catching Monthly ATM contracts (~385)
 
 # --- DYNAMIC EXPIRY SELECTION ---
-# Setting this to 40 ensures the bot skips immediate weeklies and targets the Month-End contract.
-# As today is Jan 13, 40 days lands on Feb 26 (Monthly Expiry).
-# It will automatically roll to March once February is less than 40 days away.
+# Setting this to 40 ensures we skip weeklies and find the Far-Month contract.
+# Logic: Today is Jan 13 -> skips Jan and early Feb weeklies -> Hits Feb 26.
 MIN_DTE_AT_ENTRY = 40 
 
 # Avoid last week of month
@@ -194,7 +193,6 @@ def get_greeks(flag, spot, strike, dte, iv_pct, r=0.065, q=0.012):
             'vega': round(vega(flag, spot, strike, t, r, sigma), 2)
         }
     except Exception as e:
-        print("Greeks calculation failed:", e)
         return {'delta': None, 'gamma': None, 'theta_daily': None, 'vega': None}
 
 def filter_entry(greeks, premium, iv, dte):
@@ -230,7 +228,6 @@ def manage_positions():
         pnl_points = ltp - pos['entry_premium']
         pnl_rs = pnl_points * LOT_SIZE
         
-        # Check SL
         if ltp <= pos['current_sl']:
             pos['status'] = 'closed_sl'
             pos['exit_premium'] = ltp
@@ -244,7 +241,6 @@ def manage_positions():
             save_state()
             continue
             
-        # Trailing
         mult = ltp / pos['entry_premium'] if pos['entry_premium'] > 0 else 0
         if mult >= RR_TARGET:
             new_sl = ltp - TRAIL_TIGHT_POINTS
@@ -266,11 +262,10 @@ def try_entry():
     if not spot:
         return
     
-    # TRACKING: Show the spot price found
     print(f"--- SCANNING: Nifty Spot is {spot} ---")
         
     try:
-        # Fetch wide option chain (50 strikes) to ensure ATM is captured
+        # 50 strikes ensures ATM is always captured
         exp_resp = fyers.optionchain({"symbol": "NSE:NIFTY50-INDEX", "strikecount": 50})
         
         if exp_resp.get('s') == 'ok':
@@ -279,10 +274,12 @@ def try_entry():
             target_dte = 0
             expiry_code = ""
             for exp in expiries:
-                exp_date = datetime.datetime.fromtimestamp(int(exp['expiry']))
+                # FORCE INT to avoid the string error
+                exp_val = int(exp['expiry'])
+                exp_date = datetime.datetime.fromtimestamp(exp_val)
                 dte = (exp_date - datetime.datetime.now()).days
                 if dte >= MIN_DTE_AT_ENTRY:
-                    target_ts = exp['expiry']
+                    target_ts = exp_val
                     target_dte = dte
                     expiry_code = exp_date.strftime('%d%b').upper()
                     print(f"Selected Expiry: {expiry_code} ({target_dte} days left)")
@@ -292,34 +289,33 @@ def try_entry():
                 print(f"No suitable monthly expiry found (DTE < {MIN_DTE_AT_ENTRY})")
                 return
 
-            # Target ATM Strike
             target_strike = round(spot / 50) * 50 
-            
-            # IMPROVED DETECTION: Use internal Expiry ID and Strike Price
             final_symbol = None
             options_list = exp_resp['data']['optionsChain']
             
+            # Robust Detection matching internal ID and Strike
             for opt in options_list:
-                if (opt.get('expiry') == target_ts and 
+                if (int(opt.get('expiry', 0)) == target_ts and 
                     int(opt.get('strike_price', 0)) == int(target_strike) and 
                     opt.get('option_type') == 'CE'):
                     final_symbol = opt.get('symbol')
                     break
             
-            # FALLBACK: Match by month/year name code if timestamp key is wonky
+            # Fallback using Month/Year name
             if not final_symbol:
-                month_str = datetime.datetime.fromtimestamp(target_ts).strftime('%b').upper()
-                year_str = datetime.datetime.fromtimestamp(target_ts).strftime('%y')
+                dt_obj = datetime.datetime.fromtimestamp(int(target_ts))
+                m_str = dt_obj.strftime('%b').upper()
+                y_str = dt_obj.strftime('%y')
                 for opt in options_list:
-                    symbol_str = opt.get('symbol', '')
+                    s_str = opt.get('symbol', '')
                     if (int(opt.get('strike_price', 0)) == int(target_strike) and 
                         opt.get('option_type') == 'CE' and 
-                        month_str in symbol_str and year_str in symbol_str):
+                        m_str in s_str and y_str in s_str):
                         final_symbol = opt.get('symbol')
                         break
 
             if not final_symbol:
-                print(f"DEBUG: Could not find exact symbol for {target_strike} CE in chain list.")
+                print(f"DEBUG: Could not find exact symbol for {target_strike} CE in chain.")
                 return
 
             print(f"Checking Real Symbol: {final_symbol}")
@@ -336,7 +332,6 @@ def try_entry():
             iv = quote['iv']
             greeks = get_greeks('c', spot, target_strike, target_dte, iv)
             
-            # TRACKING: Show Greeks result
             print(f"Greeks for {final_symbol}: Delta: {greeks.get('delta')}")
             
             if not filter_entry(greeks, premium, iv, target_dte):
@@ -347,15 +342,10 @@ def try_entry():
             consec_losses = 0
             
             entry_record = {
-                'symbol': final_symbol,
-                'entry_premium': premium,
-                'qty': LOT_SIZE,
+                'symbol': final_symbol, 'entry_premium': premium, 'qty': LOT_SIZE,
                 'entry_time': datetime.datetime.now().isoformat(),
-                'current_sl': premium - SL_POINTS,
-                'status': 'open',
-                'greeks': greeks,
-                'iv': iv,
-                'dte': target_dte
+                'current_sl': premium - SL_POINTS, 'status': 'open',
+                'greeks': greeks, 'iv': iv, 'dte': target_dte
             }
             
             if SIMULATION_MODE:
@@ -382,7 +372,7 @@ def run_bot_logic():
     while True:
         try:
             now = datetime.datetime.now()
-            # Indian Market Hours (9:15 to 3:30)
+            # Market Hours (9:15 to 3:30)
             if (now.hour == 9 and now.minute >= 15) or (10 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30):
                 print(f"\nScan at {now.strftime('%H:%M:%S')}")
                 if can_trade():
@@ -394,13 +384,16 @@ def run_bot_logic():
                     print(f"Market Closed. Current Time: {now.strftime('%H:%M:%S')}")
         except Exception as e:
             print("Main loop error:", e)
-        time.sleep(300) # Scan every 5 minutes
+        time.sleep(300) # 5 minutes
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is running")
+    def do_HEAD(self): # Fixes Render 501 error
+        self.send_response(200)
+        self.end_headers()
 
 def start_web_server():
     port = int(os.environ.get("PORT", 10000))
