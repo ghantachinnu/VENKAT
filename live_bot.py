@@ -1,7 +1,7 @@
 # main_strategy.py
 # Nifty Monthly Options Buyer - Simulation / Forward Test
 # Fixed for Render: Added Web Server & Fixed Option Chain Types
-# ADDED: Tracking lines to see Nifty Price and Filter status in logs.
+# ADDED: Tracking lines for Spot, Expiry, and Real Symbol Detection.
 
 import time
 import datetime
@@ -41,8 +41,8 @@ VEGA_MIN = 10
 VEGA_MAX = 28
 IV_MIN = 13
 IV_MAX = 21.5
-MIN_PREMIUM = 90
-MAX_PREMIUM = 380
+MIN_PREMIUM = 30  # Lowered slightly to ensure visibility during testing
+MAX_PREMIUM = 450 # Increased to catch current Feb premiums
 MIN_DTE_AT_ENTRY = 22
 
 # Avoid last week of month
@@ -52,7 +52,7 @@ AVOID_LAST_WEEK_DAYS = 7
 STATE_FILE = "strategy_state.json"
 TRADE_LOG_FILE = "trade_log.json"
 
-# Fyers credentials from Render
+# Fyers credentials from Render Environment Variables
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID", "").strip()
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN", "").strip()
 
@@ -102,7 +102,7 @@ def save_state():
     }
     with open(STATE_FILE, 'w') as f:
         json.dump(data, f, default=str)
-    print("State saved")
+    # print("State saved") # Commented out to reduce log noise
 
 def log_trade(trade):
     with open(TRADE_LOG_FILE, 'a') as f:
@@ -169,7 +169,7 @@ def get_option_quote(symbol):
                 'oi': d.get('oi', 0)
             }
     except Exception as e:
-        print("Quote error:", e)
+        print(f"Quote error for {symbol}:", e)
     return None
 
 def get_greeks(flag, spot, strike, dte, iv_pct, r=0.065, q=0.012):
@@ -201,7 +201,6 @@ def filter_entry(greeks, premium, iv, dte):
         dte >= MIN_DTE_AT_ENTRY
     )
     if not ok:
-        # User already has this debug line, keeping it
         print(f"Filter fail: D:{greeks['delta']} G:{greeks['gamma']} T:{greeks['theta_daily']} IV:{iv} Prem:{premium}")
     else:
         print("Entry filter PASS")
@@ -231,7 +230,7 @@ def manage_positions():
             log_trade(pos)
             consec_losses += 1
             equity_curve.append(equity_curve[-1] + pos['pnl_rs'])
-            print(f"[SIM SL] {pos['symbol']} @ {ltp:.1f} PnL: {pos['pnl_rs']:+.0f}")
+            print(f"❌ [SIM SL] {pos['symbol']} @ {ltp:.1f} PnL: {pos['pnl_rs']:+.0f}")
             virtual_positions.remove(pos)
             save_state()
             continue
@@ -249,7 +248,7 @@ def manage_positions():
             
         if new_sl > pos['current_sl']:
             pos['current_sl'] = new_sl
-            print(f"[SIM TRAIL] {pos['symbol']} new SL: {new_sl:.1f} mult: {mult:.2f}x")
+            print(f"📈 [SIM TRAIL] {pos['symbol']} new SL: {new_sl:.1f} mult: {mult:.2f}x")
 
 def try_entry():
     if not can_trade():
@@ -258,98 +257,126 @@ def try_entry():
     if not spot:
         return
     
-    # TRACKING: Show the spot price found
+    # DEBUG: Track the spot price
     print(f"--- SCANNING: Nifty Spot is {spot} ---")
         
     try:
-        # FIXED: strikecount MUST be a number (1), not an empty string ("")
-        exp_resp = fyers.optionchain({"symbol": "NSE:NIFTY50-INDEX", "strikecount": 1})
+        # Ask for Option Chain (using strikecount=15 to find ATM strikes)
+        exp_resp = fyers.optionchain({"symbol": "NSE:NIFTY50-INDEX", "strikecount": 15})
         
         if exp_resp.get('s') == 'ok':
             expiries = exp_resp['data']['expiryData']
-            expiry_code = None
+            target_ts = None
+            target_dte = 0
             for exp in expiries:
                 exp_date = datetime.datetime.fromtimestamp(int(exp['expiry']))
                 dte = (exp_date - datetime.datetime.now()).days
                 if dte >= MIN_DTE_AT_ENTRY:
+                    target_ts = exp['expiry']
+                    target_dte = dte
                     expiry_code = exp_date.strftime('%d%b').upper()
-                    # TRACKING: Show what expiry the bot selected
-                    print(f"Selected Expiry: {expiry_code} ({dte} days to go)")
+                    # DEBUG: Show which expiry was found
+                    print(f"Selected Expiry: {expiry_code} ({target_dte} days left)")
                     break
-            if not expiry_code:
+            
+            if not target_ts:
                 print("No suitable monthly expiry found (DTE < 22)")
                 return
+
+            # FIXED: Instead of building symbol name with strings, find it in the Option Chain list
+            # Pick ATM Strike (Grok Suggestion: ATM is more reliable for LTP)
+            target_strike = round(spot / 50) * 50 
+            
+            final_symbol = None
+            options_list = exp_resp['data']['optionsChain']
+            for opt in options_list:
+                # Find matching Expiry, Strike, and Type
+                if opt['expiry'] == target_ts and opt['strike_price'] == target_strike and opt['option_type'] == 'CE':
+                    final_symbol = opt['symbol']
+                    break
+            
+            if not final_symbol:
+                print(f"Could not find ATM Symbol in Fyers chain for {target_strike} CE")
+                return
+
+            # DEBUG: Show what exact symbol we are checking
+            print(f"Checking Real Symbol: {final_symbol}")
+            
+            quote = get_option_quote(final_symbol)
+            if not quote:
+                return
+            
+            # DEBUG: Show the real price we found
+            print(f"Market Price Found: ₹{quote['ltp']}")
+            
+            if quote['ltp'] < MIN_PREMIUM:
+                print(f"Skipping: {final_symbol} premium too low ({quote['ltp']})")
+                return
+                
+            premium = quote['ltp']
+            iv = quote['iv']
+            greeks = get_greeks('c', spot, target_strike, target_dte, iv)
+            
+            # DEBUG: Show Greeks result
+            print(f"Greeks for {final_symbol}: Delta: {greeks.get('delta')}")
+            
+            if not filter_entry(greeks, premium, iv, target_dte):
+                return
+                
+            global monthly_trades, consec_losses
+            monthly_trades += 1
+            consec_losses = 0
+            sl_premium = premium - SL_POINTS - SLIPPAGE_POINTS
+            
+            entry_record = {
+                'symbol': final_symbol,
+                'entry_premium': premium,
+                'qty': LOT_SIZE,
+                'entry_time': datetime.datetime.now().isoformat(),
+                'current_sl': sl_premium,
+                'status': 'open',
+                'greeks': greeks,
+                'iv': iv,
+                'dte': target_dte
+            }
+            
+            if SIMULATION_MODE:
+                virtual_positions.append(entry_record)
+                print(f"✅ [SIM ENTRY] {final_symbol} @ {premium:.1f} SL {sl_premium:.1f}")
+            else:
+                print("[LIVE ENTRY] Would place buy order here")
+            save_state()
+            
         else:
             print("Option chain error:", exp_resp)
             return
             
     except Exception as e:
-        print("Expiry fetch failed:", e)
+        print("Detailed Entry Error:", e)
         return
-
-    strike = round(spot / 50) * 50 + 100
-    symbol = f"NSE:NIFTY{expiry_code}{int(strike)}CE"
-    
-    # TRACKING: Show what symbol the bot is checking
-    print(f"Checking Symbol: {symbol}")
-    
-    quote = get_option_quote(symbol)
-    
-    if not quote or quote['ltp'] < MIN_PREMIUM:
-        if quote: print(f"Skipping: {symbol} premium too low ({quote['ltp']})")
-        return
-        
-    premium = quote['ltp']
-    iv = quote['iv']
-    dte = get_last_tuesday_dte()
-    greeks = get_greeks('c', spot, strike, dte, iv)
-    
-    # TRACKING: Show the Greeks results
-    print(f"Greeks for {symbol}: Delta: {greeks.get('delta')}, IV: {iv}")
-    
-    if not filter_entry(greeks, premium, iv, dte):
-        return
-        
-    global monthly_trades, consec_losses
-    monthly_trades += 1
-    consec_losses = 0
-    sl_premium = premium - SL_POINTS - SLIPPAGE_POINTS
-    
-    entry_record = {
-        'symbol': symbol,
-        'entry_premium': premium,
-        'qty': LOT_SIZE,
-        'entry_time': datetime.datetime.now().isoformat(),
-        'current_sl': sl_premium,
-        'status': 'open',
-        'greeks': greeks,
-        'iv': iv,
-        'dte': dte
-    }
-    
-    if SIMULATION_MODE:
-        virtual_positions.append(entry_record)
-        print(f"✅ [SIM ENTRY] {symbol} @ {premium:.1f} SL {sl_premium:.1f}")
-    else:
-        print("[LIVE ENTRY] Would place buy order here")
-    save_state()
 
 # ────────────────────────────────────────────────
 # MAIN THREADS
 # ────────────────────────────────────────────────
 def run_bot_logic():
-    print("Nifty Monthly Option Buyer - Simulation Mode Started")
+    print("Nifty Monthly Option Buyer - Bot Initialized")
     load_state()
     while True:
         try:
-            print(f"\nScan at {datetime.datetime.now().strftime('%H:%M:%S')}")
-            if can_trade():
-                try_entry()
-            manage_positions()
-            save_state()
+            now = datetime.datetime.now()
+            # Only run during market hours (9:15 AM to 3:30 PM)
+            if (now.hour == 9 and now.minute >= 15) or (10 <= now.hour < 15) or (now.hour == 15 and now.minute <= 30):
+                print(f"\nScan at {now.strftime('%H:%M:%S')}")
+                if can_trade():
+                    try_entry()
+                manage_positions()
+                save_state()
+            else:
+                if now.minute % 30 == 0: # Print every 30 mins during off-hours
+                    print(f"Market Closed. Time: {now.strftime('%H:%M:%S')}")
         except Exception as e:
             print("Main loop error:", e)
-        time.sleep(300)
+        time.sleep(300) # 5 minutes
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
