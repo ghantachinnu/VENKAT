@@ -4,3 +4,6 @@ numpy
 requests
 py_vollib
 setuptools
+firebase-admin
+google-cloud-firestore
+python-dotenv
